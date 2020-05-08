@@ -67,6 +67,34 @@ public class WebhookUtil {
         deliverMessage(channel, player, message, null, displayName);
     }
 
+    public static void deliverMessage(TextChannel channel, Player player, String message) {
+        if (channel == null) return;
+
+        Webhook targetWebhook = getWebhookToUseForChannel(channel, player.getUniqueId().toString());
+        if (targetWebhook == null) return;
+
+        Bukkit.getScheduler().runTaskAsynchronously(DiscordSRV.getPlugin(), () -> {
+            try {
+                String avatarUrl = DiscordSRV.config().getString("Experiment_WebhookChatMessageAvatarUrl");
+                if (StringUtils.isBlank(avatarUrl)) avatarUrl = "https://crafatar.com/avatars/{uuid}?overlay";
+                avatarUrl = avatarUrl
+                        .replace("{username}", player.getName())
+                        .replace("{uuid}", player.getUniqueId().toString());
+
+                HttpResponse<String> response = Unirest.post(targetWebhook.getUrl())
+                        .field("content", message)
+                        .field("username", DiscordUtil.strip(player.getDisplayName()))
+                        .field("avatar_url", avatarUrl)
+                        .asString();
+                DiscordSRV.debug("Received API response for webhook message delivery: " + response.getStatus());
+            } catch (Exception e) {
+                DiscordSRV.error("Failed to deliver webhook message to Discord: " + e.getMessage());
+                DiscordSRV.debug(ExceptionUtils.getMessage(e));
+                e.printStackTrace();
+            }
+        });
+    }
+
     public static void deliverMessage(TextChannel channel, Player player, String message, MessageEmbed embed, String displayName) {
         Bukkit.getScheduler().runTaskAsynchronously(DiscordSRV.getPlugin(), () -> {
             String avatarUrl = DiscordSRV.config().getString("Experiment_EmbedAvatarUrl");
@@ -207,5 +235,4 @@ public class WebhookUtil {
             return null;
         }
     }
-
 }
