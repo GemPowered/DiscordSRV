@@ -1,6 +1,6 @@
 /*
  * DiscordSRV - A Minecraft to Discord and back link plugin
- * Copyright (C) 2016-2019 Austin "Scarsz" Shapiro
+ * Copyright (C) 2016-2020 Austin "Scarsz" Shapiro
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -81,6 +81,7 @@ import org.apache.logging.log4j.core.LoggerContext;
 import org.bukkit.Bukkit;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.PluginCommand;
 import org.bukkit.entity.Player;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
@@ -95,7 +96,7 @@ import to.us.gempowered.chat.ChatChannel;
 
 import javax.net.ssl.SSLContext;
 import javax.security.auth.login.LoginException;
-import java.awt.*;
+import java.awt.Color;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -103,8 +104,6 @@ import java.lang.reflect.Method;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
-import java.util.List;
-import java.util.Queue;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.BiFunction;
@@ -127,18 +126,13 @@ public class DiscordSRV extends JavaPlugin implements Listener {
     @Getter private ChannelTopicUpdater channelTopicUpdater;
     @Getter private final Map<String, String> colors = new HashMap<>();
     @Getter private CommandManager commandManager = new CommandManager();
-    @Getter private File configFile = new File(getDataFolder(), "config.yml");
     @Getter private Queue<String> consoleMessageQueue = new LinkedList<>();
     @Getter private ConsoleMessageQueueWorker consoleMessageQueueWorker;
     @Getter private ScheduledExecutorService updateChecker = null;
     @Getter private ConsoleAppender consoleAppender;
-    @Getter private File debugFolder = new File(getDataFolder(), "debug");
-    @Getter private File logFolder = new File(getDataFolder(), "discord-console-logs");
-    @Getter private File messagesFile = new File(getDataFolder(), "messages.yml");
     @Getter private Gson gson = new GsonBuilder().setPrettyPrinting().create();
     @Getter private GroupSynchronizationManager groupSynchronizationManager = new GroupSynchronizationManager();
     @Getter private JDA jda = null;
-    @Getter private File linkedAccountsFile = new File(getDataFolder(), "linkedaccounts.json");
     @Getter private Random random = new Random();
     @Getter private ServerWatchdog serverWatchdog;
     @Getter private VoiceModule voiceModule;
@@ -147,6 +141,15 @@ public class DiscordSRV extends JavaPlugin implements Listener {
     @Getter private NicknameUpdater nicknameUpdater;
     @Getter private Set<PluginHook> pluginHooks = new HashSet<>();
     @Getter private long startTime = System.currentTimeMillis();
+    @Getter private File configFile = new File(getDataFolder(), "config.yml");
+    @Getter private File messagesFile = new File(getDataFolder(), "messages.yml");
+    @Getter private File voiceFile = new File(getDataFolder(), "voice.yml");
+    @Getter private File linkingFile = new File(getDataFolder(), "linking.yml");
+    @Getter private File synchronizationFile = new File(getDataFolder(), "synchronization.yml");
+    @Getter private File debugFolder = new File(getDataFolder(), "debug");
+    @Getter private File logFolder = new File(getDataFolder(), "discord-console-logs");
+    @Getter private File linkedAccountsFile = new File(getDataFolder(), "linkedaccounts.json");
+    private ExecutorService callbackThreadPool;
     private JdaFilter jdaFilter;
     private DynamicConfig config;
     private String consoleChannel;
@@ -251,11 +254,11 @@ public class DiscordSRV extends JavaPlugin implements Listener {
         // load config
         getDataFolder().mkdirs();
         config = new DynamicConfig();
-        config.addSource(DiscordSRV.class, "config", new File(getDataFolder(), "config.yml"));
-        config.addSource(DiscordSRV.class, "messages", new File(getDataFolder(), "messages.yml"));
-        config.addSource(DiscordSRV.class, "voice", new File(getDataFolder(), "voice.yml"));
-        config.addSource(DiscordSRV.class, "linking", new File(getDataFolder(), "linking.yml"));
-        config.addSource(DiscordSRV.class, "synchronization", new File(getDataFolder(), "synchronization.yml"));
+        config.addSource(DiscordSRV.class, "config", getConfigFile());
+        config.addSource(DiscordSRV.class, "messages", getMessagesFile());
+        config.addSource(DiscordSRV.class, "voice", getVoiceFile());
+        config.addSource(DiscordSRV.class, "linking", getLinkingFile());
+        config.addSource(DiscordSRV.class, "synchronization", getSynchronizationFile());
         String languageCode = System.getProperty("user.language").toUpperCase();
         Language language = null;
         try {
@@ -432,15 +435,30 @@ public class DiscordSRV extends JavaPlugin implements Listener {
                 // https://satreth.blogspot.com/2015/01/java-dns-query.html
 
                 private StrippedDnsClient client = new StrippedDnsClient();
-                private boolean dnsSucks = false;
+                private int failedRequests = 0;
                 @NotNull @Override
                 public List<InetAddress> lookup(@NotNull String host) throws UnknownHostException {
-                    if (!dnsSucks) {
+                    int max = config.getInt("MaximumAttemptsForSystemDNSBeforeUsingFallbackDNS");
+                    //  0 = everything falls back (would only be useful when the system dns literally doesn't work & can't be fixed)
+                    // <0 = nothing falls back, everything uses system dns
+                    // >0 = falls back if goes past that amount of failed requests in a row
+                    if (max < 0 || (max > 0 && failedRequests < max)) {
                         try {
-                            return Dns.SYSTEM.lookup(host);
+                            List<InetAddress> result = Dns.SYSTEM.lookup(host);
+                            failedRequests = 0; // reset on successful lookup
+                            return result;
                         } catch (Exception e) {
-                            dnsSucks = true;
-                            DiscordSRV.error("System DNS FAILED to resolve hostname " + host + ", using fallback DNS servers!");
+                            failedRequests++;
+                            DiscordSRV.error("System DNS FAILED to resolve hostname " + host + ", " +
+                                    (max == 0 ? "" : failedRequests >= max ? "using fallback DNS for this request" : "switching to fallback DNS servers") + "!");
+                            if (max == 0) {
+                                // not using fallback
+                                if (e instanceof UnknownHostException) {
+                                    throw e;
+                                } else {
+                                    return null;
+                                }
+                            }
                         }
                     }
                     return lookupPublic(host);
@@ -558,7 +576,7 @@ public class DiscordSRV extends JavaPlugin implements Listener {
             token = token.replaceAll("[^\\w\\d-_.]", "");
         }
 
-        final ExecutorService callbackThreadPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors(), pool -> {
+        callbackThreadPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors(), pool -> {
             final ForkJoinWorkerThread worker = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
             worker.setName("DiscordSRV - JDA Callback " + worker.getPoolIndex());
             return worker;
@@ -585,7 +603,7 @@ public class DiscordSRV extends JavaPlugin implements Listener {
 //                            GatewayIntent.DIRECT_MESSAGES
 //                    ))
 //                    .disableCache(Arrays.stream(CacheFlag.values()).filter(cacheFlag -> cacheFlag != CacheFlag.MEMBER_OVERRIDES && cacheFlag != CacheFlag.VOICE_STATE).collect(Collectors.toList()))
-                    .setCallbackPool(callbackThreadPool, true)
+                    .setCallbackPool(callbackThreadPool, false)
                     .setGatewayPool(gatewayThreadPool, true)
                     .setRateLimitPool(rateLimitThreadPool, true)
                     .setWebsocketFactory(new WebSocketFactory()
@@ -840,7 +858,8 @@ public class DiscordSRV extends JavaPlugin implements Listener {
 
         voiceModule = new VoiceModule();
 
-        if (getCommand("discord").getPlugin() != this) {
+        PluginCommand discordCommand = getCommand("discord");
+        if (discordCommand != null && discordCommand.getPlugin() != this) {
             DiscordSRV.warning("/discord command is being handled by plugin other than DiscordSRV. You must use /discordsrv instead.");
         }
 
@@ -980,6 +999,8 @@ public class DiscordSRV extends JavaPlugin implements Listener {
                         getLogger().warning("JDA took too long to shut down, skipping");
                     }
                 }
+
+                if (callbackThreadPool != null) callbackThreadPool.shutdownNow();
 
                 DiscordSRV.info(LangUtil.InternalMessage.SHUTDOWN_COMPLETED.toString()
                         .replace("{ms}", String.valueOf(System.currentTimeMillis() - shutdownStartTime))
@@ -1314,8 +1335,7 @@ public class DiscordSRV extends JavaPlugin implements Listener {
             message = DiscordUtil.cutPhrases(message);
 
             if (config().getBoolean("DiscordChatChannelTranslateMentions")) message = DiscordUtil.convertMentionsFromNames(message, getMainGuild());
-
-            WebhookUtil.deliverMessage(destinationChannel, player, message, playerName);
+                WebhookUtil.deliverMessage(destinationChannel, player, message, displayName);
         }
     }
 
